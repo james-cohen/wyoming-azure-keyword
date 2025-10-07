@@ -1,73 +1,186 @@
-import argparse  # noqa: D100
+#!/usr/bin/env python3
+"""
+Simple Wyoming satellite using Azure Speech SDK for wake word detection.
+"""
+
+import argparse
 import asyncio
-import contextlib
 import logging
-import os  # Import to access environment variables
-import signal
+from datetime import datetime
 from functools import partial
 
+import azure.cognitiveservices.speech as speechsdk
+from wyoming.audio import AudioChunk, AudioStart, AudioStop
+from wyoming.event import Event
 from wyoming.info import Attribution, Info, WakeModel, WakeProgram
-from wyoming.server import AsyncServer
+from wyoming.server import AsyncEventHandler, AsyncServer
+from wyoming.wake import Detection
 
-from . import KeywordDetectionConfig
-from .azure_speech_keyword import AzureSpeechKeyword
-from .handler import AzureSpeechKeywordEventHandler
 from .version import __version__
 
 _LOGGER = logging.getLogger(__name__)
 
-stop_event = asyncio.Event()
 
+class AzureWakeWordHandler(AsyncEventHandler):
+    """Handler for wake word detection using Azure Speech SDK."""
 
-def handle_stop_signal(*args):
-    """Handle shutdown signal and set the stop event."""
-    _LOGGER.info("Received stop signal. Shutting down...")
-    stop_event.set()
-    exit()
+    def __init__(
+        self,
+        wyoming_info: Info,
+        cli_args: argparse.Namespace,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
 
+        self.cli_args = cli_args
+        self.wyoming_info_event = wyoming_info.event()
+        self.loop = asyncio.get_running_loop()
 
-def parse_arguments():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--uri", default="tcp://0.0.0.0:10300", help="unix:// or tcp://"
-    )
-    parser.add_argument(
-        "--model-path",
-        default=os.getenv("MODEL_PATH"),
-        help="Path to the keyword model file",
-    )
-    parser.add_argument(
-        "--keyword-name",
-        default=os.getenv("KEYWORD_NAME"),
-        help="Name of the keyword to detect",
-    )
-    parser.add_argument("--debug", action="store_true", help="Log DEBUG messages")
-    return parser.parse_args()
+        # Azure setup
+        self.keyword_model = speechsdk.KeywordRecognitionModel(cli_args.model_path)
+        self.push_stream = None
+        self.audio_config = None
+        self.keyword_recognizer = None
+        self.is_detecting = False
 
+        _LOGGER.debug("Handler initialized")
 
-def validate_args(args):
-    """Validate command-line arguments."""
-    if not args.model_path or not args.keyword_name:
-        raise ValueError(
-            "Both --model-path and --keyword-name must be provided either as command-line arguments or environment variables."
+    async def handle_event(self, event: Event) -> bool:
+        """Handle events from Wyoming client."""
+
+        if AudioStart.is_type(event.type):
+            await self.handle_audio_start(AudioStart.from_event(event))
+        elif AudioChunk.is_type(event.type):
+            chunk = AudioChunk.from_event(event)
+            await self.handle_audio_chunk(chunk)
+        elif AudioStop.is_type(event.type):
+            self.handle_audio_stop()
+        else:
+            _LOGGER.debug("Unhandled event type: %s", event.type)
+
+        return True
+
+    async def handle_audio_start(self, audio_start: AudioStart) -> None:
+        """Start audio processing."""
+        _LOGGER.debug(
+            "Audio start: rate=%s, width=%s, channels=%s",
+            audio_start.rate,
+            audio_start.width,
+            audio_start.channels,
         )
+
+        # Create push stream with audio format
+        stream_format = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=audio_start.rate,
+            bits_per_sample=audio_start.width * 8,
+            channels=audio_start.channels,
+        )
+
+        self.push_stream = speechsdk.audio.PushAudioInputStream(stream_format)
+        self.audio_config = speechsdk.audio.AudioConfig(stream=self.push_stream)
+        self.keyword_recognizer = speechsdk.KeywordRecognizer(
+            audio_config=self.audio_config
+        )
+
+        # Set up callbacks
+        self.keyword_recognizer.recognized.connect(self._on_recognized)
+        self.keyword_recognizer.canceled.connect(self._on_canceled)
+
+        # Start recognition
+        self.is_detecting = True
+        self.keyword_recognizer.recognize_once_async(self.keyword_model)
+
+        _LOGGER.info("Wake word detection started")
+
+    async def handle_audio_chunk(self, chunk: AudioChunk) -> None:
+        """Process audio chunk."""
+        if self.push_stream and self.is_detecting:
+            # Push audio to Azure in a thread to avoid blocking
+            await asyncio.get_event_loop().run_in_executor(
+                None, self.push_stream.write, chunk.audio
+            )
+
+    def handle_audio_stop(self) -> None:
+        """Stop audio processing."""
+        _LOGGER.debug("Audio stop")
+
+        if self.push_stream:
+            self.push_stream.close()
+
+        if self.keyword_recognizer:
+            self.keyword_recognizer.stop_recognition_async()
+            self.keyword_recognizer.recognized.disconnect_all()
+            self.keyword_recognizer.canceled.disconnect_all()
+            self.keyword_recognizer = None
+
+        self.is_detecting = False
+        self.push_stream = None
+        self.audio_config = None
+
+    def _on_recognized(self, evt) -> None:
+        """Called when keyword is recognized."""
+        if evt.result.reason == speechsdk.ResultReason.RecognizedKeyword:
+            _LOGGER.info("Wake word detected: %s", evt.result.text)
+
+            # Send Detect event
+            detection = Detection(
+                name=self.cli_args.keyword_name,
+                timestamp=int(datetime.now().timestamp()),
+            )
+            asyncio.run_coroutine_threadsafe(
+                self.write_event(detection.event()), self.loop
+            )
+            _LOGGER.debug("Detect event sent")
+            if self.keyword_recognizer:
+                self.keyword_recognizer.stop_recognition_async()
+                self.keyword_recognizer.recognize_once_async(self.keyword_model)
+                _LOGGER.debug("Keyword recognizer restarted")
+
+    def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
+        """Called when keyword is canceled."""
+        _LOGGER.debug("Keyword recognition canceled", evt)
+        if evt.result.reason == speechsdk.ResultReason.Canceled:
+            _LOGGER.debug("Keyword recognition canceled")
 
 
 async def main() -> None:
-    """Start Wyoming Azure Keyword server."""
-    args = parse_arguments()
-    validate_args(args)
-
-    speech_config = KeywordDetectionConfig(
-        model_path=args.model_path,
-        keyword_name=args.keyword_name,
+    """Start Wyoming server."""
+    parser = argparse.ArgumentParser(description="Azure Speech SDK Wyoming Satellite")
+    parser.add_argument(
+        "--uri",
+        default="tcp://0.0.0.0:10400",
+        help="Wyoming server URI (default: tcp://0.0.0.0:10400)",
+    )
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        help="Path to Azure keyword model (.table file)",
+    )
+    parser.add_argument(
+        "--keyword-name",
+        default="azure_wake_word",
+        help="Name of wake word to report (default: azure_wake_word)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
     )
 
-    # Set up logging
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
-    _LOGGER.debug("Arguments parsed successfully.")
+    args = parser.parse_args()
 
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    _LOGGER.info("Starting Azure Wake Word Wyoming Server")
+    _LOGGER.info("Model: %s", args.model_path)
+    _LOGGER.info("Keyword: %s", args.keyword_name)
+    _LOGGER.info("URI: %s", args.uri)
+
+    # Create Wyoming info
     wyoming_info = Info(
         wake=[
             WakeProgram(
@@ -97,37 +210,22 @@ async def main() -> None:
         ],
     )
 
-    # Load Microsoft STT model
-    try:
-        _LOGGER.debug("Loading Azure Speech Keyword")
-        wake_model = AzureSpeechKeyword(speech_config)
-        _LOGGER.info("Azure Speech Keyword model loaded successfully.")
-    except Exception as e:
-        _LOGGER.error(f"Failed to load Azure Speech Keyword model: {e}")
-        return
-
-    # Initialize server and run
+    # Start server
     server = AsyncServer.from_uri(args.uri)
-    _LOGGER.info("Ready")
-    model_lock = asyncio.Lock()
-    try:
-        await server.run(
-            partial(
-                AzureSpeechKeywordEventHandler,
-                wyoming_info,
-                args,
-                wake_model,
-                model_lock,
-            )
+
+    _LOGGER.info("Server ready")
+
+    await server.run(
+        partial(
+            AzureWakeWordHandler,
+            wyoming_info,
+            args,
         )
-    except Exception as e:
-        _LOGGER.error(f"An error occurred while running the server: {e}")
+    )
 
 
 if __name__ == "__main__":
-    # Set up signal handling for graceful shutdown
-    signal.signal(signal.SIGTERM, handle_stop_signal)
-    signal.signal(signal.SIGINT, handle_stop_signal)
-
-    with contextlib.suppress(KeyboardInterrupt):
+    try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
