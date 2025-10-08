@@ -12,7 +12,7 @@ from functools import partial
 import azure.cognitiveservices.speech as speechsdk
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
-from wyoming.info import Attribution, Info, WakeModel, WakeProgram
+from wyoming.info import Attribution, Describe, Info, WakeModel, WakeProgram
 from wyoming.server import AsyncEventHandler, AsyncServer
 from wyoming.wake import Detection
 
@@ -56,10 +56,17 @@ class AzureWakeWordHandler(AsyncEventHandler):
             await self.handle_audio_chunk(chunk)
         elif AudioStop.is_type(event.type):
             self.handle_audio_stop()
+        elif Describe.is_type(event.type):
+            await self.handle_describe(Describe.from_event(event))
         else:
             _LOGGER.debug("Unhandled event type: %s", event.type)
 
         return True
+
+    async def handle_describe(self, describe: Describe) -> None:
+        """Handle describe event."""
+        _LOGGER.debug("Describe event: %s", describe)
+        await self.write_event(self.wyoming_info_event)
 
     async def handle_audio_start(self, audio_start: AudioStart) -> None:
         """Start audio processing."""
