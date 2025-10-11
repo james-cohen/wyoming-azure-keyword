@@ -6,6 +6,8 @@ Simple Wyoming satellite using Azure Speech SDK for wake word detection.
 import argparse
 import asyncio
 import logging
+import weakref
+from concurrent.futures import Future
 from datetime import datetime
 from functools import partial
 
@@ -43,6 +45,9 @@ class AzureWakeWordHandler(AsyncEventHandler):
         self.audio_config = None
         self.keyword_recognizer = None
         self.is_detecting = False
+
+        # Track pending futures to prevent memory leaks
+        self._pending_futures = weakref.WeakSet()
 
         _LOGGER.debug("Handler initialized")
 
@@ -130,14 +135,15 @@ class AzureWakeWordHandler(AsyncEventHandler):
         if evt.result.reason == speechsdk.ResultReason.RecognizedKeyword:
             _LOGGER.info("Wake word detected: %s", evt.result.text)
 
-            # Send Detect event
             detection = Detection(
                 name=self.cli_args.keyword_name,
                 timestamp=int(datetime.now().timestamp()),
             )
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 self.write_event(detection.event()), self.loop
             )
+            future.add_done_callback(self._on_write_event_complete)
+            self._pending_futures.add(future)
             _LOGGER.debug("Detect event sent")
             if self.keyword_recognizer:
                 self.keyword_recognizer.stop_recognition_async()
@@ -152,6 +158,14 @@ class AzureWakeWordHandler(AsyncEventHandler):
                 self.keyword_recognizer.canceled.connect(self._on_canceled)
                 self.keyword_recognizer.recognize_once_async(self.keyword_model)
                 _LOGGER.debug("Keyword recognizer restarted")
+
+    def _on_write_event_complete(self, future: Future[None]):
+        """Callback to clean up completed write_event futures."""
+        try:
+            # Get the result to ensure any exceptions are handled
+            future.result()
+        except Exception as e:
+            _LOGGER.error("Error in write_event: %s", e)
 
     def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
         """Called when keyword is canceled."""
