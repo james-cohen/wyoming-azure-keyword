@@ -141,15 +141,6 @@ class AzureWakeWordHandler(AsyncEventHandler):
             _LOGGER.debug("Detect event sent")
             if self.keyword_recognizer:
                 self.keyword_recognizer.stop_recognition_async()
-                self.keyword_recognizer.recognized.disconnect_all()
-                self.keyword_recognizer.canceled.disconnect_all()
-                self.keyword_recognizer = None
-
-                self.keyword_recognizer = speechsdk.KeywordRecognizer(
-                    audio_config=self.audio_config
-                )
-                self.keyword_recognizer.recognized.connect(self._on_recognized)
-                self.keyword_recognizer.canceled.connect(self._on_canceled)
                 self.keyword_recognizer.recognize_once_async(self.keyword_model)
                 _LOGGER.debug("Keyword recognizer restarted")
 
