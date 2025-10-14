@@ -31,6 +31,18 @@ async def shutdown_after_delay(delay: int):
     os._exit(0)
 
 
+async def check_time_exit():
+    """Check time and exit if between 2am-3am."""
+    while True:
+        now = datetime.now()
+        if now.hour == 2:
+            _LOGGER.info("Current time is between 2am and 3am, exiting process.")
+            os._exit(0)
+        else:
+            _LOGGER.info("Current time is not between 2am and 3am, continuing.")
+        await asyncio.sleep(60 * 30)  # sleep for 30 minutes
+
+
 class AzureWakeWordHandler(AsyncEventHandler):
     """Handler for wake word detection using Azure Speech SDK."""
 
@@ -53,6 +65,7 @@ class AzureWakeWordHandler(AsyncEventHandler):
         self.audio_config = None
         self.keyword_recognizer = None
         self.is_detecting = False
+        self.check_time_exit_task = None
 
         _LOGGER.debug("Handler initialized")
 
@@ -83,8 +96,8 @@ class AzureWakeWordHandler(AsyncEventHandler):
         _LOGGER.info("Memory used: %d%%", memory_used)
         if memory_used > 75:
             # Allow time for current task to finish
-            _LOGGER.info("Memory used is greater than 75%, shutting down in 30 seconds")
-            self._shutdown_timer = self.loop.create_task(shutdown_after_delay(30))
+            _LOGGER.info("Memory used is greater than 75%, shutting down in 10 seconds")
+            self._shutdown_timer = self.loop.create_task(shutdown_after_delay(10))
         elif memory_used > 90:
             # Force shutdown
             _LOGGER.info("Memory used is greater than 90%, shutting down")
@@ -176,6 +189,9 @@ class AzureWakeWordHandler(AsyncEventHandler):
                 self.keyword_recognizer.stop_recognition_async()
                 self.reset_keyword_recognizer()
                 self.check_memory()
+                if self.check_time_exit_task:
+                    self.check_time_exit_task.cancel()
+                self.check_time_exit_task = self.loop.create_task(check_time_exit())
 
     def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
         """Called when keyword is canceled."""
