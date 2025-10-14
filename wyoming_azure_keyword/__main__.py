@@ -7,19 +7,28 @@ import argparse
 import asyncio
 import gc
 import logging
+import os
 from datetime import datetime
 from functools import partial
 
 import azure.cognitiveservices.speech as speechsdk
+import psutil
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, WakeModel, WakeProgram
 from wyoming.server import AsyncEventHandler, AsyncServer
 from wyoming.wake import Detection
 
+from .debug import mem_print
 from .version import __version__
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def shutdown_after_delay(delay: int):
+    await asyncio.sleep(max(delay, 1))
+    _LOGGER.info("Shutting down after %ds of idle since last detection.", delay)
+    os._exit(0)
 
 
 class AzureWakeWordHandler(AsyncEventHandler):
@@ -37,7 +46,7 @@ class AzureWakeWordHandler(AsyncEventHandler):
         self.cli_args = cli_args
         self.wyoming_info_event = wyoming_info.event()
         self.loop = asyncio.get_running_loop()
-
+        self._shutdown_timer = None
         # Azure setup
         self.keyword_model = speechsdk.KeywordRecognitionModel(cli_args.model_path)
         self.push_stream = None
@@ -64,6 +73,23 @@ class AzureWakeWordHandler(AsyncEventHandler):
 
         return True
 
+    def check_memory(self) -> None:
+        """Handle detect event."""
+        # Cancel any existing shutdown timer
+        if self._shutdown_timer is not None:
+            self._shutdown_timer.cancel()
+        vm = psutil.virtual_memory()
+        memory_used = int(round(100 - (vm.available / vm.total * 100)))
+        _LOGGER.info("Memory used: %d%%", memory_used)
+        if memory_used > 75:
+            # Allow time for current task to finish
+            _LOGGER.info("Memory used is greater than 75%, shutting down in 30 seconds")
+            self._shutdown_timer = self.loop.create_task(shutdown_after_delay(30))
+        elif memory_used > 90:
+            # Force shutdown
+            _LOGGER.info("Memory used is greater than 90%, shutting down")
+            self._shutdown_timer = self.loop.create_task(shutdown_after_delay(1))
+
     def reset_keyword_recognizer(self) -> None:
         """Reset keyword recognizer."""
         if self.keyword_recognizer:
@@ -80,6 +106,7 @@ class AzureWakeWordHandler(AsyncEventHandler):
         self.is_detecting = True
         _LOGGER.info("Wake word detection reset")
         self.keyword_recognizer.recognize_once_async(self.keyword_model)
+        mem_print("RESET")
 
     async def handle_describe(self, describe: Describe) -> None:
         """Handle describe event."""
@@ -148,6 +175,7 @@ class AzureWakeWordHandler(AsyncEventHandler):
             if self.keyword_recognizer:
                 self.keyword_recognizer.stop_recognition_async()
                 self.reset_keyword_recognizer()
+                self.check_memory()
 
     def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
         """Called when keyword is canceled."""
