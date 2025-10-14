@@ -8,6 +8,7 @@ import asyncio
 import gc
 import logging
 import os
+import time
 from datetime import datetime
 from functools import partial
 
@@ -119,7 +120,12 @@ class AzureWakeWordHandler(AsyncEventHandler):
         self.is_detecting = True
         _LOGGER.info("Wake word detection reset")
         self.keyword_recognizer.recognize_once_async(self.keyword_model)
+        time.sleep(1)
         mem_print("RESET")
+        self.check_memory()
+        if self.check_time_exit_task:
+            self.check_time_exit_task.cancel()
+        self.check_time_exit_task = self.loop.create_task(check_time_exit())
 
     async def handle_describe(self, describe: Describe) -> None:
         """Handle describe event."""
@@ -188,10 +194,6 @@ class AzureWakeWordHandler(AsyncEventHandler):
             if self.keyword_recognizer:
                 self.keyword_recognizer.stop_recognition_async()
                 self.reset_keyword_recognizer()
-                self.check_memory()
-                if self.check_time_exit_task:
-                    self.check_time_exit_task.cancel()
-                self.check_time_exit_task = self.loop.create_task(check_time_exit())
 
     def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
         """Called when keyword is canceled."""
