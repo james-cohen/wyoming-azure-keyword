@@ -5,6 +5,7 @@ Simple Wyoming satellite using Azure Speech SDK for wake word detection.
 
 import argparse
 import asyncio
+import gc
 import logging
 from datetime import datetime
 from functools import partial
@@ -63,6 +64,23 @@ class AzureWakeWordHandler(AsyncEventHandler):
 
         return True
 
+    def reset_keyword_recognizer(self) -> None:
+        """Reset keyword recognizer."""
+        if self.keyword_recognizer:
+            del self.keyword_recognizer
+        if self.keyword_model:
+            del self.keyword_model
+        gc.collect()
+        self.keyword_recognizer = speechsdk.KeywordRecognizer(
+            audio_config=self.audio_config
+        )
+        self.keyword_recognizer.recognized.connect(self._on_recognized)
+        self.keyword_recognizer.canceled.connect(self._on_canceled)
+        self.keyword_model = speechsdk.KeywordRecognitionModel(self.cli_args.model_path)
+        self.is_detecting = True
+        _LOGGER.info("Wake word detection reset")
+        self.keyword_recognizer.recognize_once_async(self.keyword_model)
+
     async def handle_describe(self, describe: Describe) -> None:
         """Handle describe event."""
         _LOGGER.debug("Describe event: %s", describe)
@@ -86,19 +104,7 @@ class AzureWakeWordHandler(AsyncEventHandler):
 
         self.push_stream = speechsdk.audio.PushAudioInputStream(stream_format)
         self.audio_config = speechsdk.audio.AudioConfig(stream=self.push_stream)
-        self.keyword_recognizer = speechsdk.KeywordRecognizer(
-            audio_config=self.audio_config
-        )
-
-        # Set up callbacks
-        self.keyword_recognizer.recognized.connect(self._on_recognized)
-        self.keyword_recognizer.canceled.connect(self._on_canceled)
-
-        # Start recognition
-        self.is_detecting = True
-        self.keyword_recognizer.recognize_once_async(self.keyword_model)
-
-        _LOGGER.info("Wake word detection started")
+        self.reset_keyword_recognizer()
 
     async def handle_audio_chunk(self, chunk: AudioChunk) -> None:
         """Process audio chunk."""
@@ -141,8 +147,7 @@ class AzureWakeWordHandler(AsyncEventHandler):
             _LOGGER.debug("Detect event sent")
             if self.keyword_recognizer:
                 self.keyword_recognizer.stop_recognition_async()
-                self.keyword_recognizer.recognize_once_async(self.keyword_model)
-                _LOGGER.debug("Keyword recognizer restarted")
+                self.reset_keyword_recognizer()
 
     def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
         """Called when keyword is canceled."""
