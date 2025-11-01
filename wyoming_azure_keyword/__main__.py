@@ -46,6 +46,8 @@ class AzureWakeWordHandler(AsyncEventHandler):
         self.ctx = mp.get_context("spawn")
         self.check_result_task = None
         self.stream_format = None
+        self.restart_timer_task = None
+        self.restart_interval = 30  # Restart every 30 seconds
 
         _LOGGER.debug("Handler initialized")
 
@@ -90,29 +92,67 @@ class AzureWakeWordHandler(AsyncEventHandler):
             self.check_result_task.cancel()
         self.check_result_task = asyncio.create_task(self._check_detection_results())
 
+        if self.restart_timer_task:
+            self.restart_timer_task.cancel()
+        self.restart_timer_task = asyncio.create_task(self._restart_timer())
+
     def stop_detection_subprocess(self) -> None:
         """Stop and clean up the detection subprocess."""
         if self.check_result_task:
             self.check_result_task.cancel()
             self.check_result_task = None
 
-        if self.audio_queue:
+        if self.restart_timer_task:
+            self.restart_timer_task.cancel()
+            self.restart_timer_task = None
+
+        audio_q = self.audio_queue
+        result_q = self.result_queue
+        process = self.worker_process
+
+        # Clear immediately
+        self.audio_queue = None
+        self.result_queue = None
+        self.worker_process = None
+
+        # Send stop signal
+        if audio_q:
             try:
-                self.audio_queue.put_nowait(None)  # Send sentinel
+                audio_q.put_nowait(None)  # Send sentinel
             except Exception:
                 pass
 
-        if self.worker_process and self.worker_process.is_alive():
-            self.worker_process.join(timeout=2)
-            if self.worker_process.is_alive():
+        if process and process.is_alive():
+            process.join(timeout=2)
+            if process.is_alive():
                 _LOGGER.warning("Terminating subprocess")
-                self.worker_process.terminate()
-                self.worker_process.join()
+                process.terminate()
+                process.join()
             _LOGGER.info("Stopped detection subprocess")
 
-        self.worker_process = None
-        self.audio_queue = None
-        self.result_queue = None
+        if audio_q:
+            try:
+                audio_q.cancel_join_thread()
+                audio_q.close()
+            except Exception:
+                pass
+
+        if result_q:
+            try:
+                result_q.cancel_join_thread()
+                result_q.close()
+            except Exception:
+                pass
+
+    async def _restart_timer(self) -> None:
+        """Periodically restart subprocess every N seconds."""
+        try:
+            await asyncio.sleep(self.restart_interval)
+            _LOGGER.info("Periodic restart after %ds", self.restart_interval)
+            mem_print(f"PERIODIC_RESTART_{self.restart_interval}s")
+            self.start_detection_subprocess()
+        except asyncio.CancelledError:
+            pass
 
     async def _check_detection_results(self) -> None:
         """Background task to check for detection results from subprocess."""
