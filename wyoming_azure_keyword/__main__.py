@@ -5,15 +5,12 @@ Simple Wyoming satellite using Azure Speech SDK for wake word detection.
 
 import argparse
 import asyncio
-import gc
+import json
 import logging
-import os
-import time
+import multiprocessing as mp
 from datetime import datetime
 from functools import partial
 
-import azure.cognitiveservices.speech as speechsdk
-import psutil
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, WakeModel, WakeProgram
@@ -22,30 +19,13 @@ from wyoming.wake import Detection
 
 from .debug import mem_print
 from .version import __version__
+from .worker import worker_main
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def shutdown_after_delay(delay: int):
-    await asyncio.sleep(max(delay, 1))
-    _LOGGER.info("Shutting down after %ds of idle since last detection.", delay)
-    os._exit(0)
-
-
-async def check_time_exit():
-    """Check time and exit if between 2am-3am."""
-    while True:
-        now = datetime.now()
-        if now.hour == 2:
-            _LOGGER.info("Current time is between 2am and 3am, exiting process.")
-            os._exit(0)
-        else:
-            _LOGGER.info("Current time is not between 2am and 3am, continuing.")
-        await asyncio.sleep(60 * 30)  # sleep for 30 minutes
-
-
 class AzureWakeWordHandler(AsyncEventHandler):
-    """Handler for wake word detection using Azure Speech SDK."""
+    """Handler for wake word detection using Azure Speech SDK in subprocess."""
 
     def __init__(
         self,
@@ -59,14 +39,13 @@ class AzureWakeWordHandler(AsyncEventHandler):
         self.cli_args = cli_args
         self.wyoming_info_event = wyoming_info.event()
         self.loop = asyncio.get_running_loop()
-        self._shutdown_timer = None
-        # Azure setup
-        self.keyword_model = speechsdk.KeywordRecognitionModel(cli_args.model_path)
-        self.push_stream = None
-        self.audio_config = None
-        self.keyword_recognizer = None
-        self.is_detecting = False
-        self.check_time_exit_task = None
+
+        self.worker_process = None
+        self.audio_queue = None
+        self.result_queue = None
+        self.ctx = mp.get_context("spawn")
+        self.check_result_task = None
+        self.stream_format = None
 
         _LOGGER.debug("Handler initialized")
 
@@ -87,45 +66,97 @@ class AzureWakeWordHandler(AsyncEventHandler):
 
         return True
 
-    def check_memory(self) -> None:
-        """Handle detect event."""
-        # Cancel any existing shutdown timer
-        if self._shutdown_timer is not None:
-            self._shutdown_timer.cancel()
-        vm = psutil.virtual_memory()
-        memory_used = int(round(100 - (vm.available / vm.total * 100)))
-        _LOGGER.info("Memory used: %d%%", memory_used)
-        if memory_used > 75:
-            # Allow time for current task to finish
-            _LOGGER.info("Memory used is greater than 75%, shutting down in 10 seconds")
-            self._shutdown_timer = self.loop.create_task(shutdown_after_delay(10))
-        elif memory_used > 90:
-            # Force shutdown
-            _LOGGER.info("Memory used is greater than 90%, shutting down")
-            self._shutdown_timer = self.loop.create_task(shutdown_after_delay(1))
+    def start_detection_subprocess(self) -> None:
+        """Start a new detection subprocess."""
+        self.stop_detection_subprocess()
 
-    def reset_keyword_recognizer(self) -> None:
-        """Reset keyword recognizer."""
-        if self.keyword_recognizer:
-            del self.keyword_recognizer
-        if self.keyword_model:
-            del self.keyword_model
-        gc.collect()
-        self.keyword_recognizer = speechsdk.KeywordRecognizer(
-            audio_config=self.audio_config
+        self.audio_queue = self.ctx.Queue()
+        self.result_queue = self.ctx.Queue()
+
+        self.worker_process = self.ctx.Process(
+            target=worker_main,
+            args=(
+                self.cli_args.model_path,
+                self.audio_queue,
+                self.result_queue,
+                self.stream_format,
+            ),
         )
-        self.keyword_recognizer.recognized.connect(self._on_recognized)
-        self.keyword_recognizer.canceled.connect(self._on_canceled)
-        self.keyword_model = speechsdk.KeywordRecognitionModel(self.cli_args.model_path)
-        self.is_detecting = True
-        _LOGGER.info("Wake word detection reset")
-        self.keyword_recognizer.recognize_once_async(self.keyword_model)
-        time.sleep(1)
-        mem_print("RESET")
-        self.check_memory()
-        if self.check_time_exit_task:
-            self.check_time_exit_task.cancel()
-        self.check_time_exit_task = self.loop.create_task(check_time_exit())
+        self.worker_process.start()
+        _LOGGER.info("Started detection subprocess (pid=%s)", self.worker_process.pid)
+        mem_print("START")
+
+        if self.check_result_task:
+            self.check_result_task.cancel()
+        self.check_result_task = asyncio.create_task(self._check_detection_results())
+
+    def stop_detection_subprocess(self) -> None:
+        """Stop and clean up the detection subprocess."""
+        if self.check_result_task:
+            self.check_result_task.cancel()
+            self.check_result_task = None
+
+        if self.audio_queue:
+            try:
+                self.audio_queue.put_nowait(None)  # Send sentinel
+            except Exception:
+                pass
+
+        if self.worker_process and self.worker_process.is_alive():
+            self.worker_process.join(timeout=2)
+            if self.worker_process.is_alive():
+                _LOGGER.warning("Terminating subprocess")
+                self.worker_process.terminate()
+                self.worker_process.join()
+            _LOGGER.info("Stopped detection subprocess")
+
+        self.worker_process = None
+        self.audio_queue = None
+        self.result_queue = None
+
+    async def _check_detection_results(self) -> None:
+        """Background task to check for detection results from subprocess."""
+        try:
+            while True:
+                result = await self.loop.run_in_executor(
+                    None, self._get_result_nonblocking
+                )
+
+                if result:
+                    result_data = json.loads(result)
+                    if result_data.get("status") == "detected":
+                        _LOGGER.info("Wake word detected: %s", result_data.get("text"))
+
+                        # Send Detection event
+                        detection = Detection(
+                            name=self.cli_args.keyword_name,
+                            timestamp=int(datetime.now().timestamp()),
+                        )
+                        await self.write_event(detection.event())
+                        _LOGGER.debug("Detection event sent")
+
+                        # Restart subprocess for next detection
+                        self.start_detection_subprocess()
+
+                    elif result_data.get("status") == "error":
+                        _LOGGER.error("Detection error: %s", result_data.get("err"))
+
+                await asyncio.sleep(0.05)  # Check every 50ms
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            _LOGGER.error("Error checking detection results: %s", e)
+
+    def _get_result_nonblocking(self) -> str | None:
+        """Get result from queue without blocking."""
+        import queue
+
+        if not self.result_queue:
+            return None
+        try:
+            return self.result_queue.get_nowait()
+        except queue.Empty:
+            return None
 
     async def handle_describe(self, describe: Describe) -> None:
         """Handle describe event."""
@@ -141,65 +172,37 @@ class AzureWakeWordHandler(AsyncEventHandler):
             audio_start.channels,
         )
 
-        # Create push stream with audio format
-        stream_format = speechsdk.audio.AudioStreamFormat(
-            samples_per_second=audio_start.rate,
-            bits_per_sample=audio_start.width * 8,
-            channels=audio_start.channels,
-        )
+        self.stream_format = {
+            "rate": audio_start.rate,
+            "width": audio_start.width,
+            "channels": audio_start.channels,
+        }
 
-        self.push_stream = speechsdk.audio.PushAudioInputStream(stream_format)
-        self.audio_config = speechsdk.audio.AudioConfig(stream=self.push_stream)
-        self.reset_keyword_recognizer()
+        self.start_detection_subprocess()
 
     async def handle_audio_chunk(self, chunk: AudioChunk) -> None:
-        """Process audio chunk."""
-        if self.push_stream and self.is_detecting:
-            # Push audio to Azure in a thread to avoid blocking
-            await asyncio.get_event_loop().run_in_executor(
-                None, self.push_stream.write, chunk.audio
+        """Process audio chunk by sending to subprocess."""
+        if self.audio_queue and self.worker_process and self.worker_process.is_alive():
+            # Send audio to subprocess queue in executor to avoid blocking
+            await self.loop.run_in_executor(
+                None, self._send_audio_to_queue, chunk.audio
             )
+
+    def _send_audio_to_queue(self, audio_data: bytes) -> None:
+        """Send audio data to subprocess queue."""
+        if not self.audio_queue:
+            return
+        try:
+            self.audio_queue.put_nowait(audio_data)
+        except Exception as e:
+            _LOGGER.error("Failed to send audio to subprocess: %s", e)
 
     def handle_audio_stop(self) -> None:
         """Stop audio processing."""
         _LOGGER.debug("Audio stop")
 
-        if self.push_stream:
-            self.push_stream.close()
-
-        if self.keyword_recognizer:
-            self.keyword_recognizer.stop_recognition_async()
-            self.keyword_recognizer.recognized.disconnect_all()
-            self.keyword_recognizer.canceled.disconnect_all()
-            self.keyword_recognizer = None
-
-        self.is_detecting = False
-        self.push_stream = None
-        self.audio_config = None
-
-    def _on_recognized(self, evt) -> None:
-        """Called when keyword is recognized."""
-        if evt.result.reason == speechsdk.ResultReason.RecognizedKeyword:
-            _LOGGER.info("Wake word detected: %s", evt.result.text)
-
-            # Send Detect event
-            detection = Detection(
-                name=self.cli_args.keyword_name,
-                timestamp=int(datetime.now().timestamp()),
-            )
-            asyncio.run_coroutine_threadsafe(
-                self.write_event(detection.event()), self.loop
-            )
-            _LOGGER.debug("Detect event sent")
-            if self.keyword_recognizer:
-                self.keyword_recognizer.stop_recognition_async()
-                self.reset_keyword_recognizer()
-
-    def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
-        """Called when keyword is canceled."""
-        _LOGGER.debug("Keyword recognition canceled", evt)
-        if evt.result.reason == speechsdk.ResultReason.Canceled:
-            _LOGGER.debug("Keyword recognition canceled")
+        # Stop the detection subprocess
+        self.stop_detection_subprocess()
 
 
 async def main() -> None:
@@ -273,6 +276,7 @@ async def main() -> None:
 
     _LOGGER.info("Server ready")
 
+    mp.freeze_support()
     await server.run(
         partial(
             AzureWakeWordHandler,
