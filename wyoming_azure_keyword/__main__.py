@@ -8,9 +8,11 @@ import asyncio
 import json
 import logging
 import multiprocessing as mp
+import os
 from datetime import datetime
 from functools import partial
 
+from dotenv import load_dotenv
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, WakeModel, WakeProgram
@@ -22,6 +24,8 @@ from .version import __version__
 from .worker import worker_main
 
 _LOGGER = logging.getLogger(__name__)
+
+load_dotenv()
 
 
 class AzureWakeWordHandler(AsyncEventHandler):
@@ -215,7 +219,7 @@ async def main() -> None:
     )
     parser.add_argument(
         "--model-path",
-        required=True,
+        default="models/keyword.table",
         help="Path to Azure keyword model (.table file)",
     )
     parser.add_argument(
@@ -230,6 +234,11 @@ async def main() -> None:
     )
 
     args = parser.parse_args()
+    port = os.environ.get("PORT") or 10400
+    args.uri = args.uri or f"tcp://0.0.0.0:{port}"
+    args.model_path = args.model_path or os.environ.get("MODEL_PATH")
+    args.keyword_name = args.keyword_name or os.environ.get("KEYWORD_NAME")
+    args.debug = args.debug or os.environ.get("DEBUG")
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,

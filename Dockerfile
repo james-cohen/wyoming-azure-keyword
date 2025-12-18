@@ -28,15 +28,17 @@ RUN pip install --no-cache-dir -e .
 # Create a directory for models
 RUN mkdir -p /models
 
-# Expose Wyoming default port
-EXPOSE 10400
-
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+ENV MODEL_PATH=/models/keyword.table
+ENV KEYWORD_NAME=azure_wake_word
+ENV DEBUG=false
+ENV PORT=10400
+
+# Expose Wyoming port
+EXPOSE ${PORT}
 
 # Run the Wyoming server
 ENTRYPOINT ["python", "-m", "wyoming_azure_keyword"]
 
-# Default command arguments (can be overridden)
-CMD ["--uri", "tcp://0.0.0.0:10400", "--model-path", "/models/keyword.table", "--keyword-name", "azure_wake_word"]
 
