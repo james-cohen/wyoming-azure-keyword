@@ -1,0 +1,19 @@
+[project]
+name = "wyoming-azure-keyword"
+version = "1.1.0"
+description = "Wyoming wake word detection using Azure Speech SDK"
+authors = [{ name = "James Cohen", email = "github@jamescohen.com" }]
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "wyoming>=1.8.0",
+    "azure-cognitiveservices-speech>=1.47.0",
+    "python-dotenv>=1.1.1",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.13.3", "setuptools>=80.9.0", "pytest>=8.4.2"]
+
+[tool.ruff]
+line-length = 120
+exclude = ["tests", "venv", ".venv"]
