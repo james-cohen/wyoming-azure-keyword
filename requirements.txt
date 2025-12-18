@@ -1,4 +1,0 @@
-azure-cognitiveservices-speech>=1.47.0
-python-dotenv>=1.1.1
-wyoming>=1.8.0
-setuptools>=80.9.0
