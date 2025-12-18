@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+tests/__pycache__/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+!DOCKER.md
+
+# Development
+script/
+requirements_dev.txt
+docker-run.sh
+docker-test.sh
+Makefile
+
+# Mac
+.DS_Store
+
+# Test files
+tests/
+pytest.ini
+
